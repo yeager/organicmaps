@@ -1127,9 +1127,10 @@ bool RoutingManager::IsFollowTrackSourceCurrent() const
 }
 
 FollowTrackResult RoutingManager::BuildFollowedTrack(std::shared_ptr<kml::TrackData const> source,
-                                                     TrackSourcePosition entry, RouterType profile, bool keepViewport)
+                                                     TrackSourcePosition entry, bool reverse, RouterType profile,
+                                                     bool keepViewport)
 {
-  auto prepared = BuildTrackFollowingData(*source, entry);
+  auto prepared = BuildTrackFollowingData(*source, entry, reverse);
   if (!prepared)
     return prepared.error();
   auto data = std::make_shared<routing::TrackFollowingData const>(std::move(*prepared));
@@ -1138,6 +1139,7 @@ FollowTrackResult RoutingManager::BuildFollowedTrack(std::shared_ptr<kml::TrackD
   info.m_id = source->m_id;
   info.m_name = GetPreferredBookmarkStr(source->m_name);
   info.m_finish = data->m_points.back().GetPoint();
+  info.m_reversed = reverse;
   info.m_profile = profile;
   for (size_t i = 1; i < data->m_points.size(); ++i)
     info.m_lengthM += mercator::DistanceOnEarth(data->m_points[i - 1].GetPoint(), data->m_points[i].GetPoint());
@@ -1188,7 +1190,7 @@ FollowTrackResult RoutingManager::CheckFollowedTrackSource() const
   return IsFollowTrackSourceCurrent() ? FollowTrackResult::Ok : FollowTrackResult::InvalidSelection;
 }
 
-FollowTrackResult RoutingManager::RebuildFollowedTrack(RouterType profile)
+FollowTrackResult RoutingManager::RebuildFollowedTrack(bool reverse, RouterType profile)
 {
   if (!m_followSession)
     return FollowTrackResult::NoTrack;
@@ -1196,7 +1198,7 @@ FollowTrackResult RoutingManager::RebuildFollowedTrack(RouterType profile)
     return FollowTrackResult::Busy;
   if (auto const result = CheckFollowedTrackSource(); result != FollowTrackResult::Ok)
     return result;
-  return BuildFollowedTrack(m_followSession->m_source, m_followSession->m_entry, profile);
+  return BuildFollowedTrack(m_followSession->m_source, m_followSession->m_entry, reverse, profile);
 }
 
 FollowTrackResult RoutingManager::ResetFollowedTrackToPlanning()
@@ -1206,7 +1208,8 @@ FollowTrackResult RoutingManager::ResetFollowedTrackToPlanning()
     return FollowTrackResult::Busy;
   if (auto const result = CheckFollowedTrackSource(); result != FollowTrackResult::Ok)
     return result;
-  return BuildFollowedTrack(m_followSession->m_source, m_followSession->m_entry, m_followSession->m_info.m_profile);
+  return BuildFollowedTrack(m_followSession->m_source, m_followSession->m_entry, m_followSession->m_info.m_reversed,
+                            m_followSession->m_info.m_profile);
 }
 
 FollowTrackResult RoutingManager::UpdateFollowedTrackEntryAt(double distanceM)
@@ -1227,14 +1230,24 @@ FollowTrackResult RoutingManager::UpdateFollowedTrackEntryAt(double distanceM)
   auto const entry = ResolveTrackEntry(m_followSession->m_source->m_geometry, track->GetPoint(distanceM), distanceM);
   if (!entry)
     return FollowTrackResult::InvalidSelection;
-  auto const result =
-      BuildFollowedTrack(m_followSession->m_source, *entry, m_followSession->m_info.m_profile, true /* keepViewport */);
+  auto const result = BuildFollowedTrack(m_followSession->m_source, *entry, m_followSession->m_info.m_reversed,
+                                         m_followSession->m_info.m_profile, true /* keepViewport */);
   if (result == FollowTrackResult::Ok)
   {
     auto editSession = m_bmManager->GetEditSession();
     m_bmManager->SetElevationActivePoint(trackId, distanceM);
   }
   return result;
+}
+
+FollowTrackResult RoutingManager::ReverseFollowedTrack()
+{
+  CHECK_THREAD_CHECKER(m_threadChecker, ());
+  if (!m_followSession)
+    return FollowTrackResult::NoTrack;
+  if (!IsRouteBuilt())
+    return FollowTrackResult::Busy;
+  return RebuildFollowedTrack(!m_followSession->m_info.m_reversed, m_followSession->m_info.m_profile);
 }
 
 FollowTrackResult RoutingManager::SetFollowTrackProfile(RouterType type)
@@ -1244,7 +1257,7 @@ FollowTrackResult RoutingManager::SetFollowTrackProfile(RouterType type)
     return FollowTrackResult::NoTrack;
   if (GetFollowTrackRouterType(type) != type)
     return FollowTrackResult::UnsupportedProfile;
-  auto const result = RebuildFollowedTrack(type);
+  auto const result = RebuildFollowedTrack(m_followSession->m_info.m_reversed, type);
   if (result == FollowTrackResult::Ok)
     m_lastTrackProfile = type;
   return result;
@@ -1262,7 +1275,8 @@ FollowTrackResult RoutingManager::NavigateTrack(kml::TrackId trackId)
   auto const & savedProfile = track->GetData().m_routerType;
   auto const profile = GetFollowTrackRouterType(savedProfile.empty() ? m_lastTrackProfile.value_or(m_currentRouterType)
                                                                      : FromString(savedProfile));
-  return BuildFollowedTrack(std::make_shared<kml::TrackData const>(track->GetData()), *entry, profile);
+  return BuildFollowedTrack(std::make_shared<kml::TrackData const>(track->GetData()), *entry, false /* reverse */,
+                            profile);
 }
 
 void RoutingManager::SetLastUsedRouter(RouterType type)

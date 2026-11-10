@@ -1,10 +1,14 @@
 package app.organicmaps.routing;
 
+import static android.Manifest.permission.ACCESS_COARSE_LOCATION;
+import static android.Manifest.permission.ACCESS_FINE_LOCATION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import android.app.Instrumentation;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.SystemClock;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -12,22 +16,26 @@ import app.organicmaps.MwmActivity;
 import app.organicmaps.MwmApplication;
 import app.organicmaps.sdk.Framework;
 import app.organicmaps.sdk.Router;
+import app.organicmaps.sdk.bookmarks.data.BookmarkCategory;
 import app.organicmaps.sdk.bookmarks.data.BookmarkManager;
 import app.organicmaps.sdk.bookmarks.data.DataChangedListener;
 import app.organicmaps.sdk.bookmarks.data.MapObject;
+import app.organicmaps.sdk.routing.FollowTrackResult;
 import app.organicmaps.sdk.routing.ResultCodes;
 import app.organicmaps.sdk.routing.RouteMarkData;
 import app.organicmaps.sdk.routing.RouteMarkType;
 import app.organicmaps.sdk.routing.RoutingController;
 import app.organicmaps.sdk.routing.RoutingListener;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -225,8 +233,81 @@ public class RoutingControllerRecoveryTest
   }
 
   @Test
+  public void trackReversalKeepsTheControllerInSyncWithCore() throws Exception
+  {
+    final File source = File.createTempFile("reverse-track-", ".kml", mApplication.getCacheDir());
+    final String categoryName = source.getName();
+    try
+    {
+      try (FileWriter writer = new FileWriter(source))
+      {
+        writer.write(String.format("""
+            <kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+            <name>%s</name><Placemark><name>Reverse test track</name>
+            <LineString><coordinates>0,0,100 0.01,0,200</coordinates></LineString>
+            </Placemark></Document></kml>
+            """, categoryName));
+      }
+      onMain(() -> BookmarkManager.INSTANCE.loadBookmarksFile(source.getAbsolutePath(), false));
+      await("Track was not imported",
+            ()
+                -> BookmarkManager.INSTANCE.getCategories().stream().anyMatch(
+                    category -> category.getName().equals(categoryName) && category.getTracksCount() == 1));
+      onMain(() -> {
+        final BookmarkCategory category = BookmarkManager.INSTANCE.getCategories()
+                                              .stream()
+                                              .filter(item -> item.getName().equals(categoryName))
+                                              .findFirst()
+                                              .orElseThrow();
+        final long trackId = category.getTrackIdByPosition(0);
+        BookmarkManager.INSTANCE.setElevationActivePoint(trackId, 0.0);
+        assertEquals(FollowTrackResult.Ok, mController.navigateTrack(trackId));
+      });
+      await("Track preview did not finish building", mController::isBuilt);
+      onMain(() -> {
+        assertEquals(FollowTrackResult.NoRemainingGeometry, mController.reverseFollowedTrack());
+        assertTrue(mController.isPlanning());
+        assertTrue(mController.isBuilt());
+        assertFalse(mController.getFollowedTrackInfo().isReversed());
+        assertEquals(FollowTrackResult.Ok, mController.updateFollowedTrackEntryAt(400.0));
+      });
+      await("Entry update did not finish building", mController::isBuilt);
+      onMain(() -> {
+        assertEquals(FollowTrackResult.Ok, mController.reverseFollowedTrack());
+        assertTrue(mController.isPlanning());
+        assertTrue(mController.isBuilding());
+        assertEquals(FollowTrackResult.Busy, mController.reverseFollowedTrack());
+        assertTrue(mController.isBuilding());
+      });
+      await("Reversed preview did not finish building", mController::isBuilt);
+      onMain(() -> {
+        assertTrue(mController.getFollowedTrackInfo().isReversed());
+        assertEquals(400.0, mController.getFollowedTrackInfo().getLengthMeters(), 1.0);
+      });
+    }
+    finally
+    {
+      onMain(() -> {
+        mController.cancel();
+        BookmarkManager.INSTANCE.getCategories()
+            .stream()
+            .filter(category -> category.getName().equals(categoryName))
+            .findFirst()
+            .ifPresent(category -> BookmarkManager.INSTANCE.deleteCategory(category.getId()));
+      });
+      source.delete();
+    }
+  }
+
+  @Test
   public void configurationRecreationKeepsRouteRecovery() throws Exception
   {
+    // A permission dialog pauses the activity and prevents ActivityScenario from recreating it.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+      for (String permission : new String[] {ACCESS_COARSE_LOCATION, ACCESS_FINE_LOCATION})
+        if (mApplication.checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED)
+          mInstrumentation.getUiAutomation().grantRuntimePermission(mApplication.getPackageName(), permission);
+
     final DataChangedListener bookmarksListener = getBookmarksListener(mController);
     onMain(() -> {
       BookmarkManager.INSTANCE.removeCategoriesUpdatesListener(bookmarksListener);
@@ -240,15 +321,7 @@ public class RoutingControllerRecoveryTest
         original.set(activity);
         mController.prepare(point("Start", 1), point("Finish", 2), Router.Ruler);
       });
-      final AtomicBoolean built = new AtomicBoolean();
-      final long deadline = SystemClock.uptimeMillis() + TimeUnit.SECONDS.toMillis(30);
-      while (!built.get() && SystemClock.uptimeMillis() < deadline)
-      {
-        onMain(() -> built.set(mController.isBuilt()));
-        if (!built.get())
-          Thread.sleep(10);
-      }
-      assertTrue("Route did not finish building", built.get());
+      await("Route did not finish building", mController::isBuilt);
       onMain(() -> {
         mController.saveRoute();
         assertTrue(Framework.nativeHasSavedRoutePoints());
@@ -290,5 +363,19 @@ public class RoutingControllerRecoveryTest
     final FutureTask<Void> task = new FutureTask<>(action, null);
     mInstrumentation.runOnMainSync(task);
     task.get();
+  }
+
+  private void await(String message, BooleanSupplier condition) throws Exception
+  {
+    final long deadline = SystemClock.uptimeMillis() + TimeUnit.SECONDS.toMillis(30);
+    while (true)
+    {
+      final FutureTask<Boolean> task = new FutureTask<>(condition::getAsBoolean);
+      mInstrumentation.runOnMainSync(task);
+      if (task.get())
+        return;
+      assertTrue(message, SystemClock.uptimeMillis() < deadline);
+      Thread.sleep(10);
+    }
   }
 }
